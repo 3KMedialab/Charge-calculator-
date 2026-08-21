@@ -784,18 +784,26 @@
         listEl=document.getElementById('station-list');
 
     function reset(){ btn.disabled=false; label.textContent='Precio real de gasolineras cercanas'; }
-    function fail(msg){
+    function fail(msg, extra){
       reset();
-      note.innerHTML = '<span style="color:'+AMBER+'">'+msg+'</span> Puedes introducir el precio a mano, o '+
+      note.innerHTML = '<span style="color:'+AMBER+'">'+msg+'</span>'+(extra?' '+extra:'')+' Puedes introducir el precio a mano, o '+
         '<a href="https://geoportalgasolineras.es/geoportal-instalaciones/Inicio" target="_blank" '+
         'rel="noopener" style="color:'+VOLT+'">consultarlo en el Geoportal del Ministerio</a>.';
+    }
+    function stationPrice(s){
+      var keys=['Precio Gasolina 95 E5','Precio Gasolina 95 E10','Precio Gasolina 95 E5 Premium','Precio Gasolina 98 E5','Precio Gasolina 98 E10'];
+      for(var i=0;i<keys.length;i++){
+        var p=parseFloat(String(s[keys[i]]||'').replace(',','.'));
+        if(isFinite(p)&&p>0) return { price:p, grade:keys[i] };
+      }
+      return null;
     }
 
     if(!navigator.geolocation){ fail('Tu navegador no permite geolocalizaci\u00f3n.'); return; }
     btn.disabled=true; label.textContent='Localizando...';
 
     navigator.geolocation.getCurrentPosition(function(pos){
-      var lat=pos.coords.latitude, lon=pos.coords.longitude;
+      var lat=pos.coords.latitude, lon=pos.coords.longitude, acc=pos.coords.accuracy;
       label.textContent='Buscando provincia...';
       fetch('https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat='+lat+'&lon='+lon+'&zoom=8')
         .then(function(r){ return r.json(); })
@@ -815,32 +823,48 @@
         .then(function(r){ return r.json(); })
         .then(function(data){
           var list=(data&&data.ListaEESSPrecio)||[];
-          var near=[];
+          if(!list.length) throw new Error('empty-province');
+
+          var withCoords=[];
           for(var i=0;i<list.length;i++){
             var s=list[i];
-            var p=parseFloat(String(s['Precio Gasolina 95 E5']||'').replace(',','.'));
-            if(!isFinite(p)||p<=0) continue;
+            var pr=stationPrice(s);
+            if(!pr) continue;
             var sla=parseFloat(String(s['Latitud']||'').replace(',','.'));
             var slo=parseFloat(String(s['Longitud (WGS84)']||'').replace(',','.'));
             if(!isFinite(sla)||!isFinite(slo)) continue;
-            var dist=haversine(lat,lon,sla,slo);
-            if(dist<=8) near.push({ price:p, dist:dist, name:s['Rótulo']||s['Rotulo']||'Gasolinera', addr:s['Dirección']||s['Direccion']||'' });
+            withCoords.push({ price:pr.price, grade:pr.grade, dist:haversine(lat,lon,sla,slo),
+              name:s['Rótulo']||s['Rotulo']||'Gasolinera', addr:s['Dirección']||s['Direccion']||'' });
+          }
+          if(!withCoords.length) throw new Error('no-coords');
+
+          // radio progresivo: si no hay nada cerca, se ampl\u00eda en vez de rendirse
+          var radii=[8,20,50,999999], near=[], usedRadius=0;
+          for(var r=0;r<radii.length;r++){
+            near = withCoords.filter(function(x){ return x.dist<=radii[r]; });
+            if(near.length){ usedRadius=radii[r]; break; }
           }
           if(!near.length) throw new Error('no-stations');
+
           near.sort(function(a,b){ return a.price-b.price; });
           var top=near.slice(0,4);
           var avg=near.reduce(function(s,x){ return s+x.price; },0)/near.length;
+          var usesFallbackGrade = top.some(function(x){ return x.grade!=='Precio Gasolina 95 E5'; });
 
           els.fuelPrice.value = avg.toFixed(3);
-          hint.textContent = 'Media de '+near.length+' gasolineras a menos de 8 km';
+          hint.textContent = usedRadius>=999999
+            ? 'Media de '+near.length+' gasolineras de tu provincia (ninguna a menos de 50 km)'
+            : 'Media de '+near.length+' gasolineras a menos de '+usedRadius+' km';
           hint.classList.add('live');
-          note.innerHTML = 'Datos oficiales del Ministerio'+(data.Fecha ? ' \u2014 '+esc(data.Fecha) : '')+'.';
+          note.innerHTML = 'Datos oficiales del Ministerio'+(data.Fecha ? ' \u2014 '+esc(data.Fecha) : '')+
+            (usesFallbackGrade ? '. Alguna estaci\u00f3n mostrada no vende 95 E5 est\u00e1ndar; se indica el grado usado.' : '.');
 
           listEl.style.display='block';
           listEl.innerHTML = '<div class="section-title">M\u00e1s baratas cerca de ti</div>'+
             top.map(function(s){
+              var gradeNote = s.grade!=='Precio Gasolina 95 E5' ? ' \u00b7 '+esc(s.grade.replace('Precio ','')) : '';
               return '<div class="station"><div><div class="n">'+esc(s.name)+'</div>'+
-                '<div class="d">'+esc(s.addr)+' \u00b7 '+fmt(s.dist,1)+' km</div></div>'+
+                '<div class="d">'+esc(s.addr)+' \u00b7 '+fmt(s.dist,1)+' km'+gradeNote+'</div></div>'+
                 '<div class="p num">'+fmt(s.price,3)+' '+EURO+'</div></div>';
             }).join('')+
             '<div class="field-hint" style="margin-top:4px;">Toca un precio y c\u00e1mbialo arriba si vas a repostar en una concreta.</div>';
@@ -848,8 +872,11 @@
           render(); reset();
         })
         .catch(function(err){
-          if(err && err.message==='no-province') fail('No he podido identificar tu provincia.');
-          else if(err && err.message==='no-stations') fail('No hay gasolineras con precio de 95 a menos de 8 km.');
+          var accTxt = (typeof acc==='number') ? ' (precisi\u00f3n GPS: \u00b1'+Math.round(acc)+' m)' : '';
+          if(err && err.message==='no-province') fail('No he podido identificar tu provincia a partir de tu ubicaci\u00f3n'+accTxt+'.');
+          else if(err && err.message==='empty-province') fail('El Ministerio no ha devuelto datos para tu provincia ahora mismo.');
+          else if(err && err.message==='no-coords') fail('Los datos han llegado pero sin coordenadas v\u00e1lidas; puede ser un problema temporal del servicio.');
+          else if(err && err.message==='no-stations') fail('No hay ninguna gasolinera con precio de 95 en toda tu provincia'+accTxt+', lo cual es muy raro \u2014 puede que la ubicaci\u00f3n detectada est\u00e9 mal.');
           else fail('El servicio del Ministerio no ha respondido (puede bloquear peticiones desde el navegador).');
         });
     }, function(){ fail('No has dado permiso de ubicaci\u00f3n.'); }, { timeout:8000 });
